@@ -1,0 +1,40 @@
+name: Bug Report
+description: File a bug report to help us improve pst2mbox
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug!
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment Info
+      description: OS version, Python version, pst2mbox version, or whether using standalone .exe.
+      placeholder: "e.g. Windows 11, Python 3.11 / Standalone exe 2.0.0"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps To Reproduce
+      description: Steps or command used to reproduce the behavior.
+      placeholder: |
+        1. Run command 'pst2mbox input.pst output.mbox'
+        2. See error ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Log Output
+      description: Please copy and paste any relevant log output (run with `-v` for debug logs).
+      render: shell

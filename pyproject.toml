@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pst2mbox"
+version = "2.0.0"
+description = "High-performance, memory-efficient Outlook PST and OST to standard mbox format converter."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "pst2mbox Contributors" },
+]
+keywords = [
+    "pst",
+    "ost",
+    "mbox",
+    "outlook",
+    "converter",
+    "email",
+    "migration",
+    "thunderbird",
+    "email-migration",
+    "libpff",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "libpff-python>=20230000",
+    "striprtf>=0.0.26",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+pst2mbox = "pst2mbox.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/pst2mbox/pst2mbox"
+Repository = "https://github.com/pst2mbox/pst2mbox"
+Issues = "https://github.com/pst2mbox/pst2mbox/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra -q"
