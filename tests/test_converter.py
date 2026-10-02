@@ -301,5 +301,112 @@ class TestPSTToMboxConverter(unittest.TestCase):
         read_mb.close()
 
 
+class message:  # noqa: N801 - name mirrors pypff.message, which the recovery path checks by type name
+    pass
+
+
+class folder_stub:  # noqa: N801
+    """Folder whose message table is damaged but whose item tree is intact."""
+
+    name = "Inbox"
+    number_of_sub_folders = 0
+
+    def __init__(self, items, table_ok=False):
+        self._items = items
+        self._table_ok = table_ok
+
+    @property
+    def number_of_sub_messages(self):
+        if self._table_ok:
+            return len(self._items)
+        raise OSError("libpff_table_read_index_entries: invalid table index offset")
+
+    @property
+    def number_of_sub_items(self):
+        return len(self._items)
+
+    def get_sub_item(self, i):
+        return self._items[i]
+
+    def get_sub_message(self, i):
+        return self._items[i]
+
+
+class root_stub:  # noqa: N801
+    name = ""
+    number_of_sub_messages = 0
+    number_of_sub_folders = 1
+
+    def __init__(self, sub):
+        self._sub = sub
+
+    def get_sub_folder(self, i):
+        return self._sub
+
+
+class pff_stub:  # noqa: N801
+    number_of_orphan_items = 0
+
+    def __init__(self, root):
+        self._root = root
+
+    def get_root_folder(self):
+        return self._root
+
+
+class TestMboxFromLine(unittest.TestCase):
+    def test_non_ascii_sender_is_sanitised(self):
+        f = PSTToMboxConverter._mbox_from_address
+        self.assertEqual(f("jürgen@example.com"), "jurgen@example.com")
+        self.assertEqual(f("Üö ä"), "UoA".replace("A", "a"))
+        self.assertEqual(f("日本"), "MAILER-DAEMON")
+        self.assertEqual(f(None), "MAILER-DAEMON")
+
+    def test_mbox_write_with_non_ascii_sender(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pst = Path(tmp) / "t.pst"
+            pst.write_bytes(b"x")
+            conv = PSTToMboxConverter(pst, Path(tmp) / "o.mbox", quiet=True)
+            msg = MockPffMessage(subject="Hi", sender_email="jürgen@müller.de", sender_name="Jürgen")
+            email_msg, _, _ = conv.convert_pst_message_to_email(msg, "Inbox")
+            box = mailbox.mbox(str(Path(tmp) / "o.mbox"))
+            box.add(email_msg)
+            box.flush()
+            box.close()
+            self.assertEqual(len(mailbox.mbox(str(Path(tmp) / "o.mbox"))), 1)
+
+
+class TestDamagedFolderRecovery(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.pst = Path(self.tmp.name) / "t.pst"
+        self.pst.write_bytes(b"x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _iterate(self, folder):
+        conv = PSTToMboxConverter(self.pst, Path(self.tmp.name) / "o.mbox", quiet=True)
+        return conv, list(conv._iterate_pypff(pff_stub(root_stub(folder))))
+
+    def test_damaged_table_recovered_via_item_tree(self):
+        items = [message(), message(), object()]  # last one is not a message and must be skipped
+        conv, found = self._iterate(folder_stub(items))
+        self.assertEqual(len(found), 2)
+        self.assertEqual(conv.recovered_folders, ["Inbox"])
+        self.assertEqual(conv.unreadable_folders, [])
+
+    def test_unreadable_folder_is_reported(self):
+        conv, found = self._iterate(folder_stub([]))
+        self.assertEqual(found, [])
+        self.assertEqual(conv.unreadable_folders, ["Inbox"])
+
+    def test_healthy_folder_uses_normal_path(self):
+        conv, found = self._iterate(folder_stub([message()], table_ok=True))
+        self.assertEqual(len(found), 1)
+        self.assertEqual(conv.recovered_folders, [])
+        self.assertEqual(conv.unreadable_folders, [])
+
+
 if __name__ == "__main__":
     unittest.main()

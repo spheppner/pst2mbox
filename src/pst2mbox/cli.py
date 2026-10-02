@@ -158,8 +158,18 @@ def run_interactive_mode() -> int:
     return 0 if success else 1
 
 
+def _ensure_utf8_output() -> None:
+    """Avoid UnicodeEncodeError for status symbols on legacy Windows console code pages."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main(argv=None) -> int:
     """Main CLI entry point."""
+    _ensure_utf8_output()
     if argv is None:
         argv = sys.argv[1:]
 

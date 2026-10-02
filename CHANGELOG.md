@@ -2,6 +2,16 @@
 
 All notable changes to `pst2mbox` are documented in this file.
 
+## [2.0.1] - 2026-10-02
+
+### 🐛 Bug Fixes
+- **Silently skipped folders (data loss)**: A folder whose message table is damaged (libpff: `invalid table index offset value out of bounds`) was treated as empty, so e.g. an entire Inbox could be missing from the output while the run reported success. Such errors are no longer swallowed.
+- **Automatic recovery of damaged folders**: When a folder's message table cannot be read, messages are now recovered through libpff's independent item tree. On a 10 GB PST this recovered an Inbox of ~15,400 messages that v2.0.0 dropped.
+- **Honest reporting**: Unreadable folders and failed messages are logged as errors, listed in the final summary ("COMPLETED WITH WARNINGS - OUTPUT IS INCOMPLETE"), shown by `--stats-only`, and make the exit code non-zero. Recovered folders are listed as warnings.
+- **Console encoding crash**: Fixed `UnicodeEncodeError` on Windows consoles using legacy code pages by forcing UTF-8 output.
+
+---
+
 ## [2.0.0] - 2026-10-02
 
 ### 🚀 Major Improvements & Architecture Refactoring

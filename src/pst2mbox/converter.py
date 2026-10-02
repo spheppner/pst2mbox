@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import unicodedata
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 from pst2mbox.header_helper import HeaderItemsHelper
@@ -170,6 +171,8 @@ class PSTToMboxConverter:
         self.attachments_found = 0
         self.attachments_extracted = 0
         self.attachment_bytes = 0
+        self.unreadable_folders: List[str] = []  # folders whose messages could not be read at all
+        self.recovered_folders: List[str] = []  # folders with damaged tables read via the item tree
         self.metadata_records: List[Dict[str, Any]] = []
 
         self._setup_logging()
@@ -714,7 +717,7 @@ class PSTToMboxConverter:
             msg["Date"] = email.utils.format_datetime(dt)
 
             asctime_date = dt.strftime("%a %b %d %H:%M:%S %Y")
-            msg.set_unixfrom(f"From {sender_email} {asctime_date}")
+            msg.set_unixfrom(f"From {self._mbox_from_address(sender_email)} {asctime_date}")
 
             if recipients["To"]:
                 msg["To"] = ", ".join(recipients["To"])
@@ -761,6 +764,20 @@ class PSTToMboxConverter:
             self.logger.error(f"Error converting PST message to email: {e}", exc_info=self.verbose)
             raise
 
+    @staticmethod
+    def _mbox_from_address(address: Optional[str]) -> str:
+        """Make an address safe for the mbox 'From ' separator line, which must be ASCII without spaces."""
+        text = unicodedata.normalize("NFKD", address or "")
+        text = "".join(ch for ch in text if ord(ch) < 128 and not ch.isspace() and ch.isprintable())
+        return text or "MAILER-DAEMON"
+
+    @staticmethod
+    def _count_sub_items(folder: Any) -> int:
+        try:
+            return int(folder.number_of_sub_items)
+        except Exception:
+            return 0
+
     def _iterate_pypff(self, pff_file: Any) -> Iterator[Tuple[str, Any]]:
         """Recursively iterate over all folders and submessages using pypff."""
         root_folder = pff_file.get_root_folder()
@@ -773,21 +790,42 @@ class PSTToMboxConverter:
             )
             current_path = f"{path}/{folder_name}".strip("/") if path else folder_name
 
-            num_msgs = (
-                self.safe_get_attr(folder, "number_of_sub_messages", 0)
-                or self.safe_get_attr(folder, "get_number_of_sub_messages", 0)
-                or 0
-            )
+            msg_source = None
+            try:
+                num_msgs = folder.number_of_sub_messages
+                msg_source = "table"
+            except Exception as e:
+                # The folder's contents table is damaged. libpff cannot list its messages the normal
+                # way, but the item tree (sub_items) is independent of that table and usually intact.
+                self.logger.warning(
+                    f"Folder '{current_path}': message table unreadable ({str(e).split('.')[0]}). "
+                    "Trying recovery via the item tree..."
+                )
+                num_msgs = self._count_sub_items(folder)
+                if num_msgs:
+                    msg_source = "items"
+                    self.recovered_folders.append(current_path)
+                    self.logger.warning(f"Folder '{current_path}': recovering up to {num_msgs} item(s) from item tree.")
+                else:
+                    self.unreadable_folders.append(current_path)
+                    self.logger.error(
+                        f"Folder '{current_path}' could NOT be read and no items could be recovered. "
+                        "Its messages are MISSING from the output. Try repairing the PST with Outlook's "
+                        "Inbox Repair Tool (scanpst.exe) and run again."
+                    )
+                    num_msgs = 0
+
             if num_msgs > 0:
                 self.logger.debug(f"Scanning folder: '{current_path}' ({num_msgs} messages)")
                 self.processed_folders += 1
                 for m_idx in range(num_msgs):
                     try:
-                        msg = None
-                        if hasattr(folder, "get_sub_message"):
+                        if msg_source == "items":
+                            msg = folder.get_sub_item(m_idx)
+                            if type(msg).__name__ != "message":
+                                continue  # sub-folder or other non-message entry
+                        else:
                             msg = folder.get_sub_message(m_idx)
-                        elif hasattr(folder, "sub_messages") and m_idx < len(folder.sub_messages):
-                            msg = folder.sub_messages[m_idx]
 
                         if msg:
                             yield current_path, msg
@@ -795,23 +833,21 @@ class PSTToMboxConverter:
                         self.failed_emails += 1
                         self.logger.error(f"Failed reading message {m_idx} in folder '{current_path}': {e}")
 
-            num_subfolders = (
-                self.safe_get_attr(folder, "number_of_sub_folders", 0)
-                or self.safe_get_attr(folder, "get_number_of_sub_folders", 0)
-                or 0
-            )
+            try:
+                num_subfolders = folder.number_of_sub_folders
+            except Exception as e:
+                self.unreadable_folders.append(f"{current_path} (subfolders)")
+                self.logger.error(f"Cannot list sub-folders of '{current_path}': {e}")
+                num_subfolders = 0
+
             for f_idx in range(num_subfolders):
                 try:
-                    sub = None
-                    if hasattr(folder, "get_sub_folder"):
-                        sub = folder.get_sub_folder(f_idx)
-                    elif hasattr(folder, "sub_folders") and f_idx < len(folder.sub_folders):
-                        sub = folder.sub_folders[f_idx]
-
+                    sub = folder.get_sub_folder(f_idx)
                     if sub:
                         yield from _traverse_folder(sub, current_path)
                 except Exception as e:
-                    self.logger.error(f"Failed traversing subfolder {f_idx} in '{current_path}': {e}")
+                    self.unreadable_folders.append(f"{current_path}/#{f_idx}")
+                    self.logger.error(f"Failed traversing sub-folder {f_idx} in '{current_path}': {e}")
 
         yield from _traverse_folder(root_folder)
 
@@ -953,9 +989,10 @@ class PSTToMboxConverter:
             for f_name, count in sorted(folder_counts.items()):
                 print(f"  - {f_name}: {count} messages")
             print("=" * 55 + "\n")
+            self._log_problem_report()
             if pff_handle:
                 pff_handle.close()
-            return True
+            return not self.unreadable_folders
 
         open_mbox_files: Dict[Union[str, Path], mailbox.mbox] = {}
 
@@ -1028,7 +1065,13 @@ class PSTToMboxConverter:
             elif self.output_file.exists():
                 out_size_mb = self.output_file.stat().st_size / (1024 * 1024)
 
-        status_header = "🔍 DRY-RUN COMPLETED" if self.dry_run else "🎉 CONVERSION COMPLETED SUCCESSFULLY"
+        has_problems = bool(self.unreadable_folders or self.failed_emails)
+        if has_problems:
+            status_header = "⚠️  COMPLETED WITH WARNINGS - OUTPUT IS INCOMPLETE"
+        elif self.dry_run:
+            status_header = "🔍 DRY-RUN COMPLETED"
+        else:
+            status_header = "🎉 CONVERSION COMPLETED SUCCESSFULLY"
         self.logger.info("\n" + "=" * 55)
         self.logger.info(status_header)
         self.logger.info("=" * 55)
@@ -1047,6 +1090,23 @@ class PSTToMboxConverter:
         self.logger.info(f"Total time elapsed:    {duration:.2f} seconds")
         if self.processed_emails > 0 and duration > 0:
             self.logger.info(f"Average speed:         {self.processed_emails / duration:.1f} emails/second")
+        self._log_problem_report()
         self.logger.info("=" * 55 + "\n")
 
-        return True
+        return not self.unreadable_folders
+
+    def _log_problem_report(self) -> None:
+        """Summarise damaged / unreadable folders so incomplete output is never silent."""
+        if self.recovered_folders:
+            self.logger.warning(
+                f"Recovered {len(self.recovered_folders)} folder(s) with a damaged message table via the item tree: "
+                + ", ".join(self.recovered_folders)
+            )
+        if self.unreadable_folders:
+            self.logger.error(
+                f"{len(self.unreadable_folders)} folder(s) could NOT be read - their messages are MISSING: "
+                + ", ".join(self.unreadable_folders)
+            )
+            self.logger.error("Repair the PST with Outlook's Inbox Repair Tool (scanpst.exe) and convert again.")
+        if self.failed_emails:
+            self.logger.error(f"{self.failed_emails} message(s) failed and are missing from the output.")

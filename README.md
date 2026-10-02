@@ -193,6 +193,12 @@ pytest
 
 ---
 
+## 🩹 Damaged PST Files
+
+`pst2mbox` tolerates damaged PST files: if a folder's message table is corrupt, messages are recovered via the PST's item tree and the folder is listed as *recovered* in the summary. Folders that cannot be read at all are reported as errors (exit code 1) so that incomplete output is never silent. In that case, run Outlook's Inbox Repair Tool (`scanpst.exe`) on a **copy** of the PST and convert the repaired copy.
+
+---
+
 ## ⚠️ Disclaimer & Liability
 
 This software is provided **"as is"**, without warranty of any kind, express or implied. **The author takes no liability for lost, damaged or corrupted data, failed or incomplete conversions, or any other direct or indirect damage** resulting from the use of this software. `pst2mbox` only reads your PST/OST file and never modifies it, but you use it entirely at your own risk. **Always keep a backup of your original files** and verify the converted output before deleting anything. See the [LICENSE](LICENSE) for the full terms.
