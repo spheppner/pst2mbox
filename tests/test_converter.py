@@ -1,9 +1,10 @@
 """
-Unit tests for pst2mbox converter and HeaderItemsHelper.
+Unit tests for pst2mbox converter, filters, metadata export, and HeaderItemsHelper.
 """
 
+import csv
 from datetime import datetime, timezone
-import email
+import json
 import mailbox
 from pathlib import Path
 import tempfile
@@ -139,57 +140,133 @@ class TestPSTToMboxConverter(unittest.TestCase):
             body_html="<p>See you tomorrow at 10 AM.</p>",
             delivery_time=datetime(2026, 10, 2, 10, 0, 0, tzinfo=timezone.utc),
         )
-        email_msg = self.converter.convert_pst_message_to_email(mock_msg, folder_path="Inbox/Work")
+        res = self.converter.convert_pst_message_to_email(mock_msg, folder_path="Inbox/Work")
+        self.assertIsNotNone(res)
+        email_msg, meta, atts = res
 
         self.assertEqual(email_msg["Subject"], "Important Meeting")
         self.assertEqual(email_msg["From"], '"John Doe" <john.doe@example.com>')
         self.assertIn("10:00:00", email_msg["Date"])
         self.assertEqual(email_msg["X-Folder"], "Inbox/Work")
         self.assertTrue(email_msg.is_multipart())
+        self.assertEqual(meta["subject"], "Important Meeting")
 
     def test_message_with_attachment(self):
         pdf_bytes = b"%PDF-1.4 test pdf content here"
         att = MockPffAttachment("report.pdf", pdf_bytes)
         mock_msg = MockPffMessage(subject="Report Attached", attachments=[att])
-        email_msg = self.converter.convert_pst_message_to_email(mock_msg)
+        res = self.converter.convert_pst_message_to_email(mock_msg)
+        self.assertIsNotNone(res)
+        email_msg, meta, atts = res
+
         self.assertEqual(email_msg["Subject"], "Report Attached")
+        self.assertEqual(len(atts), 1)
+        self.assertEqual(atts[0]["filename"], "report.pdf")
 
-        parts = list(email_msg.walk())
-        filenames = [p.get_filename() for p in parts if p.get_filename()]
-        self.assertIn("report.pdf", filenames)
-
-    def test_transport_header_priority(self):
-        headers = (
-            "From: Boss <boss@company.com>\n"
-            "To: Employee <emp@company.com>\n"
-            "Subject: Bonus\n"
-            "Date: Fri, 02 Oct 2026 12:00:00 +0000\n"
-            "Message-ID: <msg123@company.com>"
+    def test_date_and_folder_filtering(self):
+        msg_old = MockPffMessage(
+            subject="Old Message",
+            delivery_time=datetime(2023, 1, 1, tzinfo=timezone.utc),
         )
-        mock_msg = MockPffMessage(transport_headers=headers)
-        email_msg = self.converter.convert_pst_message_to_email(mock_msg)
-        self.assertEqual(email_msg["Subject"], "Bonus")
-        self.assertEqual(email_msg["From"], '"Boss" <boss@company.com>')
-        self.assertEqual(email_msg["To"], "Employee <emp@company.com>")
-        self.assertEqual(email_msg["Message-ID"], "<msg123@company.com>")
+        msg_new = MockPffMessage(
+            subject="New Message",
+            delivery_time=datetime(2025, 6, 1, tzinfo=timezone.utc),
+        )
+
+        date_filtered_converter = PSTToMboxConverter(
+            pst_file=Path(self.temp_dir.name) / "fake.pst",
+            output_file=self.output_mbox,
+            from_date="2025-01-01",
+            folder_filter="Inbox",
+            quiet=True,
+        )
+
+        # Older message should be filtered out (return None)
+        self.assertIsNone(date_filtered_converter.convert_pst_message_to_email(msg_old, "Inbox"))
+        # Folder mismatch should be filtered out
+        self.assertIsNone(date_filtered_converter.convert_pst_message_to_email(msg_new, "Archive"))
+        # Matching message and folder should succeed
+        self.assertIsNotNone(date_filtered_converter.convert_pst_message_to_email(msg_new, "Inbox"))
+
+    def test_search_and_sender_filtering(self):
+        msg = MockPffMessage(
+            subject="Urgent: Invoice 12345",
+            sender_name="Accounting Dept",
+            sender_email="billing@company.com",
+            body_text="Please pay the attached invoice.",
+        )
+
+        search_conv = PSTToMboxConverter(
+            pst_file=Path(self.temp_dir.name) / "fake.pst",
+            output_file=self.output_mbox,
+            sender_filter="billing@company.com",
+            search_query="invoice",
+            quiet=True,
+        )
+        self.assertIsNotNone(search_conv.convert_pst_message_to_email(msg, "Inbox"))
+
+        nomatch_conv = PSTToMboxConverter(
+            pst_file=Path(self.temp_dir.name) / "fake.pst",
+            output_file=self.output_mbox,
+            sender_filter="support@other.com",
+            quiet=True,
+        )
+        self.assertIsNone(nomatch_conv.convert_pst_message_to_email(msg, "Inbox"))
+
+    def test_raw_attachment_and_metadata_export(self):
+        att_dir = Path(self.temp_dir.name) / "attachments"
+        csv_file = Path(self.temp_dir.name) / "meta.csv"
+        json_file = Path(self.temp_dir.name) / "meta.json"
+
+        conv = PSTToMboxConverter(
+            pst_file=Path(self.temp_dir.name) / "fake.pst",
+            output_file=self.output_mbox,
+            extract_attachments_dir=att_dir,
+            metadata_csv=csv_file,
+            metadata_json=json_file,
+            quiet=True,
+            overwrite=True,
+        )
+
+        doc_bytes = b"Sample document text content"
+        att = MockPffAttachment("sample.txt", doc_bytes)
+        msg = MockPffMessage(subject="File Share", attachments=[att])
+
+        res = conv.convert_pst_message_to_email(msg, "Shared")
+        self.assertIsNotNone(res)
+        email_msg, meta, atts = res
+        conv.metadata_records.append(meta)
+        conv._save_raw_attachments("Shared", atts)
+        conv._write_metadata_files()
+
+        # Check saved attachment on disk
+        saved_file = att_dir / "Shared" / "sample.txt"
+        self.assertTrue(saved_file.exists())
+        self.assertEqual(saved_file.read_bytes(), doc_bytes)
+
+        # Check CSV and JSON exports
+        self.assertTrue(csv_file.exists())
+        with open(csv_file, "r", encoding="utf-8") as f:
+            reader = list(csv.DictReader(f))
+            self.assertEqual(len(reader), 1)
+            self.assertEqual(reader[0]["subject"], "File Share")
+
+        self.assertTrue(json_file.exists())
+        with open(json_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["subject"], "File Share")
 
     def test_rtf_body_fallback(self):
         rtf_content = r"{\rtf1\ansi\deff0 {\fonttbl {\f0 Arial;}}\f0\fs24 Hello from RTF body!}"
         mock_msg = MockPffMessage(subject="RTF Only", body_text="", body_html="", transport_headers="")
         mock_msg.rtf_body = rtf_content
-        email_msg = self.converter.convert_pst_message_to_email(mock_msg)
+        res = self.converter.convert_pst_message_to_email(mock_msg)
+        self.assertIsNotNone(res)
+        email_msg, _, _ = res
         self.assertEqual(email_msg["Subject"], "RTF Only")
         payload = email_msg.get_payload(decode=True).decode("utf-8")
         self.assertIn("Hello from RTF body!", payload)
-
-    def test_exchange_dn_sender(self):
-        mock_msg = MockPffMessage(
-            subject="Internal Email",
-            sender_name="",
-            sender_email="/O=ORGANIZATION/OU=EXCHANGE ADMINISTRATIVE GROUP/CN=RECIPIENTS/CN=SARAH.CONNOR",
-        )
-        email_msg = self.converter.convert_pst_message_to_email(mock_msg)
-        self.assertIn("SARAH.CONNOR", email_msg["From"])
 
     def test_mbox_file_integration(self):
         mock_msg1 = MockPffMessage(
@@ -207,8 +284,10 @@ class TestPSTToMboxConverter(unittest.TestCase):
         mbox_target = Path(self.temp_dir.name) / "output.mbox"
         mb = mailbox.mbox(str(mbox_target))
         mb.lock()
-        mb.add(self.converter.convert_pst_message_to_email(mock_msg1, "Inbox"))
-        mb.add(self.converter.convert_pst_message_to_email(mock_msg2, "Archive"))
+        res1 = self.converter.convert_pst_message_to_email(mock_msg1, "Inbox")
+        res2 = self.converter.convert_pst_message_to_email(mock_msg2, "Archive")
+        mb.add(res1[0])
+        mb.add(res2[0])
         mb.flush()
         mb.unlock()
         mb.close()

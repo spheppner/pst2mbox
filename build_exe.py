@@ -54,6 +54,8 @@ def build_executable() -> bool:
             "--console",
             "--name",
             "pst2mbox",
+            "--icon",
+            "assets/icon.ico",
             "--paths",
             "src",
             "--add-data",

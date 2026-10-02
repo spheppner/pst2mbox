@@ -6,7 +6,7 @@ a = Analysis(
     ['src/pst2mbox/cli.py'],
     pathex=['src'],
     binaries=[],
-    datas=[('README.md', '.'), ('LICENSE', '.')],
+    datas=[('README.md', '.'), ('LICENSE', '.'), ('assets/icon.ico', 'assets')],
     hiddenimports=[
         'pst2mbox',
         'pst2mbox.converter',
@@ -73,4 +73,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/icon.ico',
 )

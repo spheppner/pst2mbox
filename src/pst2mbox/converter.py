@@ -1,7 +1,8 @@
 """
-Core PST/OST to mbox converter implementation.
+Core PST/OST to mbox converter implementation with advanced filtering and metadata extraction.
 """
 
+import csv
 from datetime import datetime, timezone
 import email
 from email import encoders
@@ -10,6 +11,7 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import email.utils
+import json
 import logging
 import mailbox
 import mimetypes
@@ -67,45 +69,108 @@ MAPI_PR_EMAIL_ADDRESS = 0x3003
 MAPI_PR_SMTP_ADDRESS = 0x39FE
 
 
+def parse_date_arg(date_str: Optional[Union[str, datetime]]) -> Optional[datetime]:
+    """Parse date string into timezone-aware datetime."""
+    if not date_str:
+        return None
+    if isinstance(date_str, datetime):
+        return date_str if date_str.tzinfo is not None else date_str.replace(tzinfo=timezone.utc)
+
+    date_str = str(date_str).strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d"):
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        raise ValueError(f"Invalid date format '{date_str}'. Expected format: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
+
+
 class PSTToMboxConverter:
     """Convert Outlook PST files to standard mbox format with high efficiency and robust error handling."""
 
     def __init__(
         self,
         pst_file: Union[str, Path],
-        output_file: Union[str, Path],
+        output_file: Optional[Union[str, Path]] = None,
         verbose: bool = False,
         quiet: bool = False,
         overwrite: bool = False,
         split_folders: bool = False,
         include_orphans: bool = False,
+        from_date: Optional[Union[str, datetime]] = None,
+        to_date: Optional[Union[str, datetime]] = None,
+        folder_filter: Optional[str] = None,
+        sender_filter: Optional[str] = None,
+        recipient_filter: Optional[str] = None,
+        search_query: Optional[str] = None,
+        extract_attachments_dir: Optional[Union[str, Path]] = None,
+        metadata_csv: Optional[Union[str, Path]] = None,
+        metadata_json: Optional[Union[str, Path]] = None,
+        dry_run: bool = False,
+        stats_only: bool = False,
     ):
         """
         Initialize the converter.
 
         Args:
-            pst_file: Path to the input PST/OST file.
-            output_file: Path to the output mbox file (or directory if split_folders).
-            verbose: Enable detailed debug logging.
+            pst_file: Path to input PST/OST file.
+            output_file: Path to output mbox file or directory.
+            verbose: Enable debug logging.
             quiet: Suppress non-error output.
-            overwrite: Overwrite existing output file(s) without prompt.
-            split_folders: Split conversion into separate mbox files per folder.
-            include_orphans: Include recovered orphan items if found.
+            overwrite: Overwrite existing output file(s).
+            split_folders: Export each PST folder into a separate mbox file.
+            include_orphans: Include recovered orphaned/deleted items.
+            from_date: Only convert emails sent on or after this date.
+            to_date: Only convert emails sent on or before this date.
+            folder_filter: Case-insensitive folder substring filter.
+            sender_filter: Case-insensitive sender name/email filter.
+            recipient_filter: Case-insensitive recipient filter.
+            search_query: Case-insensitive keyword search in subject/body.
+            extract_attachments_dir: Directory to save all extracted binary attachments.
+            metadata_csv: Path to export metadata table as CSV.
+            metadata_json: Path to export metadata table as JSON.
+            dry_run: Simulate conversion without writing output files.
+            stats_only: Inspect and print PST folder & message statistics without converting.
         """
         self.pst_file = Path(pst_file).resolve()
-        self.output_file = Path(output_file).resolve()
+        self.output_file = Path(output_file).resolve() if output_file else None
         self.verbose = verbose
         self.quiet = quiet
         self.overwrite = overwrite
         self.split_folders = split_folders
         self.include_orphans = include_orphans
 
+        # Filters
+        self.from_date = parse_date_arg(from_date)
+        self.to_date = parse_date_arg(to_date)
+        self.folder_filter = folder_filter.strip().lower() if folder_filter else None
+        self.sender_filter = sender_filter.strip().lower() if sender_filter else None
+        self.recipient_filter = recipient_filter.strip().lower() if recipient_filter else None
+        self.search_query = search_query.strip().lower() if search_query else None
+
+        # Output extras
+        self.extract_attachments_dir = Path(extract_attachments_dir).resolve() if extract_attachments_dir else None
+        self.metadata_csv = Path(metadata_csv).resolve() if metadata_csv else None
+        self.metadata_json = Path(metadata_json).resolve() if metadata_json else None
+        self.dry_run = dry_run
+        self.stats_only = stats_only
+
+        # Metrics
         self.processed_emails = 0
+        self.skipped_emails = 0
         self.failed_emails = 0
         self.processed_folders = 0
         self.attachments_found = 0
         self.attachments_extracted = 0
         self.attachment_bytes = 0
+        self.metadata_records: List[Dict[str, Any]] = []
 
         self._setup_logging()
 
@@ -138,17 +203,33 @@ class PSTToMboxConverter:
         if self.pst_file.suffix.lower() not in [".pst", ".ost"]:
             self.logger.warning(f"File extension is not .pst or .ost: {self.pst_file.name}")
 
-        if self.split_folders:
-            self.output_file.mkdir(parents=True, exist_ok=True)
-        else:
-            self.output_file.parent.mkdir(parents=True, exist_ok=True)
-            if self.output_file.exists() and not self.overwrite:
-                try:
-                    response = input(f"Output file '{self.output_file.name}' already exists. Overwrite? (y/N): ")
-                    if response.strip().lower() not in ["y", "yes"]:
-                        raise ValueError("Operation cancelled by user.")
-                except EOFError:
-                    raise ValueError(f"Output file '{self.output_file}' already exists. Use --overwrite to replace.")
+        if self.stats_only:
+            return
+
+        if not self.output_file and not self.dry_run and not self.metadata_csv and not self.metadata_json:
+            raise ValueError("Output file/directory must be specified unless --dry-run or --stats-only is used.")
+
+        if self.output_file and not self.dry_run:
+            if self.split_folders:
+                self.output_file.mkdir(parents=True, exist_ok=True)
+            else:
+                self.output_file.parent.mkdir(parents=True, exist_ok=True)
+                if self.output_file.exists() and not self.overwrite:
+                    try:
+                        response = input(f"Output file '{self.output_file.name}' already exists. Overwrite? (y/N): ")
+                        if response.strip().lower() not in ["y", "yes"]:
+                            raise ValueError("Operation cancelled by user.")
+                    except EOFError:
+                        raise ValueError(f"Output file '{self.output_file}' already exists. Use --overwrite to replace.")
+
+        if self.extract_attachments_dir and not self.dry_run:
+            self.extract_attachments_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.metadata_csv and not self.dry_run:
+            self.metadata_csv.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.metadata_json and not self.dry_run:
+            self.metadata_json.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def safe_get_attr(obj: Any, attr: str, default: Any = None) -> Any:
@@ -215,7 +296,6 @@ class PSTToMboxConverter:
         address = (address or "").strip()
         name = (name or "").strip()
 
-        # Clean Exchange X.500 DNs like /O=EXCHANGELABS/OU=...
         if address.startswith("/") and "=" in address:
             cn_matches = re.findall(r"cn=([^/]+)", address, re.IGNORECASE)
             if cn_matches:
@@ -266,7 +346,6 @@ class PSTToMboxConverter:
                     if not att:
                         continue
 
-                    # Extract attachment filename from multiple possible attributes
                     filename = (
                         self.safe_get_attr(att, "long_filename")
                         or self.safe_get_attr(att, "get_long_filename")
@@ -274,7 +353,6 @@ class PSTToMboxConverter:
                         or self.safe_get_attr(att, "get_name")
                     )
 
-                    # If not found via direct attributes, search record sets
                     if not filename and hasattr(att, "get_number_of_record_sets"):
                         for r_idx in range(self.safe_get_attr(att, "get_number_of_record_sets", 0) or 0):
                             rs = att.get_record_set(r_idx)
@@ -284,7 +362,6 @@ class PSTToMboxConverter:
                             if filename:
                                 break
 
-                    # Sanitize filename
                     if filename:
                         filename = self.safe_decode(filename)
                         filename = os.path.basename(filename).strip()
@@ -292,7 +369,6 @@ class PSTToMboxConverter:
 
                     size = self.safe_get_attr(att, "size", 0) or self.safe_get_attr(att, "get_size", 0) or 0
 
-                    # Read binary data
                     data = None
                     if hasattr(att, "read_buffer"):
                         try:
@@ -309,7 +385,6 @@ class PSTToMboxConverter:
                     if data is None:
                         data = self.safe_get_attr(att, "data", None)
 
-                    # Determine MIME type
                     actual_size = len(data) if data else 0
                     if not filename:
                         ext = ".bin"
@@ -350,7 +425,6 @@ class PSTToMboxConverter:
         sender_name = ""
         sender_email = ""
 
-        # 1. Try transport headers
         has_from, from_val = hih.get_header_item("From")
         if has_from and from_val:
             parsed_name, parsed_addr = email.utils.parseaddr(from_val)
@@ -363,7 +437,6 @@ class PSTToMboxConverter:
                     sender_email = match.group(1)
                     sender_name = from_val.replace(match.group(0), "").strip(' <"\'>\t\n\r')
 
-        # 2. Check direct PST message attributes
         if not sender_name:
             sender_name = self.safe_decode(
                 self.safe_get_attr(pst_message, "sender_name") or self.safe_get_attr(pst_message, "get_sender_name")
@@ -371,7 +444,6 @@ class PSTToMboxConverter:
         if not sender_email:
             sender_email = self.safe_decode(self.safe_get_attr(pst_message, "sender_email_address"))
 
-        # 3. Check record sets for MAPI properties
         if hasattr(pst_message, "get_number_of_record_sets"):
             try:
                 for r_idx in range(pst_message.get_number_of_record_sets()):
@@ -391,7 +463,6 @@ class PSTToMboxConverter:
             except Exception:
                 pass
 
-        # Cleanup Exchange DNs
         if sender_email and sender_email.startswith("/") and "=" in sender_email:
             cn_matches = re.findall(r"cn=([^/]+)", sender_email, re.IGNORECASE)
             if cn_matches:
@@ -413,13 +484,11 @@ class PSTToMboxConverter:
         """Extract To, Cc, Bcc recipients from transport headers or message recipient structures."""
         recipients = {"To": [], "Cc": [], "Bcc": []}
 
-        # 1. Transport headers
         for field in ("To", "Cc", "Bcc"):
             exists, val = hih.get_header_item(field)
             if exists and val:
                 recipients[field].append(val)
 
-        # 2. If transport headers didn't have recipients, check PST recipient structures
         if not recipients["To"] and not recipients["Cc"] and not recipients["Bcc"]:
             recips_obj = self.safe_get_attr(pst_message, "recipients")
             if recips_obj and hasattr(recips_obj, "get_number_of_recipients"):
@@ -468,7 +537,7 @@ class PSTToMboxConverter:
         return recipients
 
     def _extract_datetime(self, pst_message: Any, hih: HeaderItemsHelper) -> datetime:
-        """Extract delivery / message timestamp as a valid datetime object and RFC 2822 string."""
+        """Extract delivery / message timestamp as a valid timezone-aware datetime object."""
         for attr in (
             "delivery_time",
             "get_delivery_time",
@@ -481,7 +550,7 @@ class PSTToMboxConverter:
         ):
             dt = self.safe_get_attr(pst_message, attr)
             if isinstance(dt, datetime):
-                return dt
+                return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
             elif isinstance(dt, (int, float)) and dt > 0:
                 try:
                     return datetime.fromtimestamp(dt, tz=timezone.utc)
@@ -493,15 +562,59 @@ class PSTToMboxConverter:
             try:
                 dt = email.utils.parsedate_to_datetime(date_val.strip())
                 if dt:
-                    return dt
+                    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
             except Exception:
                 pass
 
         return datetime.now(timezone.utc)
 
-    def convert_pst_message_to_email(self, pst_message: Any, folder_path: str = "") -> email.message.Message:
+    def _matches_filters(
+        self,
+        folder_path: str,
+        sender_name: str,
+        sender_email: str,
+        recipients: Dict[str, List[str]],
+        dt: datetime,
+        subject: str,
+        body_text: str,
+    ) -> bool:
+        """Evaluate user filters (date range, folder, sender, recipient, search keyword)."""
+        # 1. Folder filter
+        if self.folder_filter and self.folder_filter not in folder_path.lower():
+            return False
+
+        # 2. Date range filter
+        if self.from_date and dt < self.from_date:
+            return False
+        if self.to_date and dt > self.to_date:
+            return False
+
+        # 3. Sender filter
+        if self.sender_filter:
+            combined_sender = f"{sender_name} {sender_email}".lower()
+            if self.sender_filter not in combined_sender:
+                return False
+
+        # 4. Recipient filter
+        if self.recipient_filter:
+            all_recips = " ".join(recipients["To"] + recipients["Cc"] + recipients["Bcc"]).lower()
+            if self.recipient_filter not in all_recips:
+                return False
+
+        # 5. Search keyword query
+        if self.search_query:
+            combined_text = f"{subject} {body_text}".lower()
+            if self.search_query not in combined_text:
+                return False
+
+        return True
+
+    def convert_pst_message_to_email(
+        self, pst_message: Any, folder_path: str = ""
+    ) -> Optional[Tuple[email.message.Message, Dict[str, Any], List[Dict[str, Any]]]]:
         """
-        Convert a single PST message into a standard email.message.Message object.
+        Convert a single PST message into a standard email Message, returning (email_msg, metadata, attachments).
+        Returns None if message does not match user filters.
         """
         try:
             raw_headers = (
@@ -531,8 +644,36 @@ class PSTToMboxConverter:
                 else:
                     body_text = body_rtf
 
+            subject = ""
+            has_subj, header_subj = hih.get_header_item("Subject")
+            if has_subj and header_subj:
+                subject = header_subj
+            else:
+                subject = self.safe_decode(
+                    self.safe_get_attr(pst_message, "subject") or self.safe_get_attr(pst_message, "get_subject")
+                )
+            subject = subject or "(No Subject)"
+
+            sender_name, sender_email = self._extract_sender_info(pst_message, hih)
+            recipients = self._extract_recipients(pst_message, hih)
+            dt = self._extract_datetime(pst_message, hih)
+
+            # Apply filters
+            if not self._matches_filters(
+                folder_path=folder_path,
+                sender_name=sender_name,
+                sender_email=sender_email,
+                recipients=recipients,
+                dt=dt,
+                subject=subject,
+                body_text=body_text,
+            ):
+                self.skipped_emails += 1
+                return None
+
             attachments = self.extract_attachments(pst_message)
 
+            # Build MIME message
             if attachments:
                 msg = MIMEMultipart("mixed")
                 if body_html and body_text:
@@ -568,27 +709,13 @@ class PSTToMboxConverter:
             else:
                 msg = MIMEText("(No message body)", "plain", "utf-8")
 
-            subject = ""
-            has_subj, header_subj = hih.get_header_item("Subject")
-            if has_subj and header_subj:
-                subject = header_subj
-            else:
-                subject = self.safe_decode(
-                    self.safe_get_attr(pst_message, "subject") or self.safe_get_attr(pst_message, "get_subject")
-                )
-
-            msg["Subject"] = subject or "(No Subject)"
-
-            sender_name, sender_email = self._extract_sender_info(pst_message, hih)
+            msg["Subject"] = subject
             msg["From"] = self.format_email_address(sender_email, sender_name)
-
-            dt = self._extract_datetime(pst_message, hih)
             msg["Date"] = email.utils.format_datetime(dt)
 
             asctime_date = dt.strftime("%a %b %d %H:%M:%S %Y")
             msg.set_unixfrom(f"From {sender_email} {asctime_date}")
 
-            recipients = self._extract_recipients(pst_message, hih)
             if recipients["To"]:
                 msg["To"] = ", ".join(recipients["To"])
             if recipients["Cc"]:
@@ -615,7 +742,20 @@ class PSTToMboxConverter:
             if folder_path:
                 msg["X-Folder"] = folder_path
 
-            return msg
+            meta = {
+                "folder": folder_path,
+                "subject": subject,
+                "from": msg["From"],
+                "to": msg.get("To", ""),
+                "cc": msg.get("Cc", ""),
+                "bcc": msg.get("Bcc", ""),
+                "date": dt.isoformat(),
+                "message_id": msg["Message-ID"],
+                "attachments_count": len(attachments),
+                "attachments": [a["filename"] for a in attachments],
+            }
+
+            return msg, meta, attachments
 
         except Exception as e:
             self.logger.error(f"Error converting PST message to email: {e}", exc_info=self.verbose)
@@ -698,8 +838,70 @@ class PSTToMboxConverter:
                 pass
             yield folder_path, pst_message
 
+    def _save_raw_attachments(self, folder_path: str, attachments: List[Dict[str, Any]]) -> None:
+        """Save raw binary attachments to target directory."""
+        if not self.extract_attachments_dir or self.dry_run:
+            return
+
+        clean_folder = re.sub(r'[\\/*?:"<>|]', "_", folder_path).strip("_") or "General"
+        target_dir = self.extract_attachments_dir / clean_folder
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        for att in attachments:
+            data = att.get("data")
+            if data:
+                filename = att.get("filename", "attachment.bin")
+                file_path = target_dir / filename
+                # If file exists, append timestamp/index
+                if file_path.exists():
+                    stem = file_path.stem
+                    suffix = file_path.suffix
+                    file_path = target_dir / f"{stem}_{int(time.time()*1000)%100000}{suffix}"
+                try:
+                    file_path.write_bytes(data)
+                except Exception as e:
+                    self.logger.warning(f"Failed writing raw attachment '{file_path}': {e}")
+
+    def _write_metadata_files(self) -> None:
+        """Export gathered metadata records to CSV and/or JSON."""
+        if self.dry_run or not self.metadata_records:
+            return
+
+        if self.metadata_csv:
+            try:
+                with open(self.metadata_csv, "w", newline="", encoding="utf-8") as f:
+                    fieldnames = [
+                        "folder",
+                        "subject",
+                        "from",
+                        "to",
+                        "cc",
+                        "bcc",
+                        "date",
+                        "message_id",
+                        "attachments_count",
+                        "attachments",
+                    ]
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for rec in self.metadata_records:
+                        row = rec.copy()
+                        row["attachments"] = "; ".join(row["attachments"])
+                        writer.writerow(row)
+                self.logger.info(f"Exported metadata CSV: {self.metadata_csv}")
+            except Exception as e:
+                self.logger.error(f"Failed exporting metadata CSV: {e}")
+
+        if self.metadata_json:
+            try:
+                with open(self.metadata_json, "w", encoding="utf-8") as f:
+                    json.dump(self.metadata_records, f, indent=2, ensure_ascii=False)
+                self.logger.info(f"Exported metadata JSON: {self.metadata_json}")
+            except Exception as e:
+                self.logger.error(f"Failed exporting metadata JSON: {e}")
+
     def convert(self) -> bool:
-        """Execute the conversion process."""
+        """Execute the conversion, filtering, or statistics process."""
         start_time = time.time()
         self.logger.info(f"Starting PST to mbox conversion: '{self.pst_file.name}'")
 
@@ -730,10 +932,35 @@ class PSTToMboxConverter:
                 self.logger.error(f"Failed opening PST file with libratom: {e}")
                 return False
 
+        # Stats-only inspection
+        if self.stats_only:
+            folder_counts: Dict[str, int] = {}
+            total_items = 0
+            msg_iterator = self._iterate_pypff(pff_handle) if HAS_PYPFF else self._iterate_libratom(pst_archive)
+            for folder_path, _ in msg_iterator:
+                folder_counts[folder_path] = folder_counts.get(folder_path, 0) + 1
+                total_items += 1
+
+            pst_size_mb = self.pst_file.stat().st_size / (1024 * 1024)
+            print("\n" + "=" * 55)
+            print("📊 PST ARCHIVE STATISTICS")
+            print("=" * 55)
+            print(f"File:           {self.pst_file}")
+            print(f"File Size:      {pst_size_mb:.2f} MB")
+            print(f"Total Folders:  {len(folder_counts)}")
+            print(f"Total Messages: {total_items}")
+            print("\nFolder Breakdown:")
+            for f_name, count in sorted(folder_counts.items()):
+                print(f"  - {f_name}: {count} messages")
+            print("=" * 55 + "\n")
+            if pff_handle:
+                pff_handle.close()
+            return True
+
         open_mbox_files: Dict[Union[str, Path], mailbox.mbox] = {}
 
         try:
-            if not self.split_folders:
+            if self.output_file and not self.split_folders and not self.dry_run:
                 main_mbox = mailbox.mbox(str(self.output_file))
                 main_mbox.lock()
                 open_mbox_files["default"] = main_mbox
@@ -742,20 +969,30 @@ class PSTToMboxConverter:
 
             for folder_path, pst_message in msg_iterator:
                 try:
-                    email_msg = self.convert_pst_message_to_email(pst_message, folder_path)
+                    result = self.convert_pst_message_to_email(pst_message, folder_path)
+                    if result is None:
+                        continue
 
-                    if self.split_folders:
-                        clean_folder = re.sub(r'[\\/*?:"<>|]', "_", folder_path).strip("_") or "Inbox"
-                        folder_mbox_path = self.output_file / f"{clean_folder}.mbox"
-                        if folder_mbox_path not in open_mbox_files:
-                            m = mailbox.mbox(str(folder_mbox_path))
-                            m.lock()
-                            open_mbox_files[folder_mbox_path] = m
-                        target_mbox = open_mbox_files[folder_mbox_path]
-                    else:
-                        target_mbox = open_mbox_files["default"]
+                    email_msg, meta, attachments = result
+                    self.metadata_records.append(meta)
 
-                    target_mbox.add(email_msg)
+                    if self.extract_attachments_dir and attachments:
+                        self._save_raw_attachments(folder_path, attachments)
+
+                    if self.output_file and not self.dry_run:
+                        if self.split_folders:
+                            clean_folder = re.sub(r'[\\/*?:"<>|]', "_", folder_path).strip("_") or "Inbox"
+                            folder_mbox_path = self.output_file / f"{clean_folder}.mbox"
+                            if folder_mbox_path not in open_mbox_files:
+                                m = mailbox.mbox(str(folder_mbox_path))
+                                m.lock()
+                                open_mbox_files[folder_mbox_path] = m
+                            target_mbox = open_mbox_files[folder_mbox_path]
+                        else:
+                            target_mbox = open_mbox_files["default"]
+
+                        target_mbox.add(email_msg)
+
                     self.processed_emails += 1
 
                     if self.processed_emails % 100 == 0:
@@ -774,6 +1011,8 @@ class PSTToMboxConverter:
                     m.unlock()
                     m.close()
 
+            self._write_metadata_files()
+
         finally:
             if pff_handle:
                 try:
@@ -783,22 +1022,28 @@ class PSTToMboxConverter:
 
         duration = time.time() - start_time
         out_size_mb = 0.0
-        if self.split_folders:
-            out_size_mb = sum(f.stat().st_size for f in self.output_file.glob("*.mbox")) / (1024 * 1024)
-        elif self.output_file.exists():
-            out_size_mb = self.output_file.stat().st_size / (1024 * 1024)
+        if self.output_file and not self.dry_run:
+            if self.split_folders:
+                out_size_mb = sum(f.stat().st_size for f in self.output_file.glob("*.mbox")) / (1024 * 1024)
+            elif self.output_file.exists():
+                out_size_mb = self.output_file.stat().st_size / (1024 * 1024)
 
+        status_header = "🔍 DRY-RUN COMPLETED" if self.dry_run else "🎉 CONVERSION COMPLETED SUCCESSFULLY"
         self.logger.info("\n" + "=" * 55)
-        self.logger.info("🎉 CONVERSION COMPLETED SUCCESSFULLY")
+        self.logger.info(status_header)
         self.logger.info("=" * 55)
         self.logger.info(f"Input file:            {self.pst_file}")
-        self.logger.info(f"Output location:       {self.output_file}")
+        if self.output_file:
+            self.logger.info(f"Output location:       {self.output_file}")
         self.logger.info(f"Emails converted:      {self.processed_emails}")
+        if self.skipped_emails > 0:
+            self.logger.info(f"Emails filtered out:   {self.skipped_emails}")
         self.logger.info(f"Failed emails:         {self.failed_emails}")
         self.logger.info(
             f"Attachments extracted: {self.attachments_extracted} ({self.attachment_bytes / (1024*1024):.2f} MB)"
         )
-        self.logger.info(f"Total output size:     {out_size_mb:.2f} MB")
+        if self.output_file and not self.dry_run:
+            self.logger.info(f"Total output size:     {out_size_mb:.2f} MB")
         self.logger.info(f"Total time elapsed:    {duration:.2f} seconds")
         if self.processed_emails > 0 and duration > 0:
             self.logger.info(f"Average speed:         {self.processed_emails / duration:.1f} emails/second")

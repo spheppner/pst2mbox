@@ -60,9 +60,9 @@ dev = [
 pst2mbox = "pst2mbox.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/pst2mbox/pst2mbox"
-Repository = "https://github.com/pst2mbox/pst2mbox"
-Issues = "https://github.com/pst2mbox/pst2mbox/issues"
+Homepage = "https://github.com/spheppner/pst2mbox"
+Repository = "https://github.com/spheppner/pst2mbox"
+Issues = "https://github.com/spheppner/pst2mbox/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
