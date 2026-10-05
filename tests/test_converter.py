@@ -54,6 +54,21 @@ class TestHeaderItemsHelper(unittest.TestCase):
         self.assertEqual(h.get_header_item("Subject")[1], "Hello World 🚀")
         self.assertEqual(h.get_header_item("From")[1], "André <andre@example.com>")
 
+    def test_parsing_stops_at_end_of_header_block(self):
+        raw = (
+            "Subject: Outer\r\nTo: a@example.com\r\n\r\n--boundary\r\nContent-Type: message/rfc822\r\n\r\n"
+            "Subject: Attached mail\r\nTo: b@example.com\r\n"
+        )
+        h = HeaderItemsHelper(raw)
+        self.assertEqual(h.get_header_item("Subject"), (True, "Outer"))
+        self.assertEqual(h.get_header_item("To"), (True, "a@example.com"))
+        self.assertFalse(h.contains_header_item("Content-Type"))
+
+    def test_single_value_headers_return_first_occurrence(self):
+        h = HeaderItemsHelper("Received: one\r\nSubject: First\r\nReceived: two\r\nSubject: Second\r\n")
+        self.assertEqual(h.get_header_item("Subject"), (True, "First"))
+        self.assertEqual(h.get_header_item("Received"), (True, "one\ntwo"))
+
     def test_get_dict_and_names(self):
         raw = "From: Alice <alice@example.com>\nTo: Bob <bob@example.com>\nSubject: Hi"
         h = HeaderItemsHelper(raw)
@@ -267,6 +282,53 @@ class TestPSTToMboxConverter(unittest.TestCase):
         self.assertEqual(email_msg["Subject"], "RTF Only")
         payload = email_msg.get_payload(decode=True).decode("utf-8")
         self.assertIn("Hello from RTF body!", payload)
+
+    def test_rtf_emoji_surrogates_are_joined(self):
+        # striprtf turns RTF \uN escapes for emoji into UTF-16 surrogate halves, which UTF-8 cannot encode
+        rtf_content = r"{\rtf1\ansi Handy \u-10179?\u-8975? funktioniert}"
+        mock_msg = MockPffMessage(subject="Emoji", body_text="", body_html="")
+        mock_msg.rtf_body = rtf_content
+        email_msg, _, _ = self.converter.convert_pst_message_to_email(mock_msg)
+        payload = email_msg.get_payload(decode=True).decode("utf-8")
+        self.assertIn("Handy \U0001f4f1 funktioniert", payload)
+
+    def test_rtf_with_undecodable_byte_is_still_converted(self):
+        # \'8d is undefined in cp1252; striprtf used to raise and the raw RTF source ended up as the body
+        mock_msg = MockPffMessage(subject="RTF", body_text="", body_html="")
+        mock_msg.rtf_body = r"{\rtf1\ansi\ansicpg1252 Gr\'fc\'dfe \'8d Ende}"
+        email_msg, _, _ = self.converter.convert_pst_message_to_email(mock_msg)
+        payload = email_msg.get_payload(decode=True).decode("utf-8")
+        self.assertIn("Grüße", payload)
+        self.assertNotIn("rtf1", payload)
+
+    def test_lone_surrogates_are_replaced(self):
+        mock_msg = MockPffMessage(subject="Broken \ud83d text", body_text="a\udcf1b", body_html="")
+        email_msg, _, _ = self.converter.convert_pst_message_to_email(mock_msg)
+        self.assertEqual(email_msg["Subject"], "Broken � text")
+        self.assertIn("a�b", email_msg.get_payload(decode=True).decode("utf-8"))
+        email_msg.as_bytes()
+
+    def test_duplicate_transport_headers_use_first_value(self):
+        headers = (
+            "Subject: Panalpina / Rahbanan AZ 009-912-10\r\n"
+            "From: Alice <alice@example.com>\r\n"
+            "\r\n"
+            "Subject: AW: Unfall vom 9.1.2010\r\n"
+            "From: Bob <bob@example.com>\r\n"
+        )
+        mock_msg = MockPffMessage(transport_headers=headers)
+        email_msg, _, _ = self.converter.convert_pst_message_to_email(mock_msg)
+        self.assertEqual(email_msg["Subject"], "Panalpina / Rahbanan AZ 009-912-10")
+        self.assertEqual(email_msg["From"], '"Alice" <alice@example.com>')
+        email_msg.as_bytes()  # used to raise "header value appears to contain an embedded header"
+
+    def test_line_breaks_in_header_values_are_removed(self):
+        mock_msg = MockPffMessage(subject="Line one\r\nLine two", sender_name="Jane\nDoe")
+        email_msg, _, _ = self.converter.convert_pst_message_to_email(mock_msg, "Inbox\nSub")
+        self.assertEqual(email_msg["Subject"], "Line one Line two")
+        self.assertEqual(email_msg["From"], '"Jane Doe" <sender@example.com>')
+        self.assertEqual(email_msg["X-Folder"], "Inbox Sub")
+        email_msg.as_bytes()
 
     def test_mbox_file_integration(self):
         mock_msg1 = MockPffMessage(

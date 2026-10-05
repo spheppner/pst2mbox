@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pst2mbox"
-version = "2.0.1"
+version = "2.0.2"
 description = "High-performance, memory-efficient Outlook PST and OST to standard mbox format converter."
 readme = "README.md"
 requires-python = ">=3.8"

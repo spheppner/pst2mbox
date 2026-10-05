@@ -69,6 +69,9 @@ MAPI_PR_DISPLAY_NAME = 0x3001
 MAPI_PR_EMAIL_ADDRESS = 0x3003
 MAPI_PR_SMTP_ADDRESS = 0x39FE
 
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+_HEADER_BREAK_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 
 def parse_date_arg(date_str: Optional[Union[str, datetime]]) -> Optional[datetime]:
     """Parse date string into timezone-aware datetime."""
@@ -248,12 +251,27 @@ class PSTToMboxConverter:
             return default
 
     @staticmethod
-    def safe_decode(data: Any, default: str = "") -> str:
+    def fix_surrogates(text: str) -> str:
+        """Join UTF-16 surrogate pairs (e.g. emoji from RTF \\uN escapes) and replace lone surrogates.
+
+        Such strings cannot be encoded as UTF-8 and would make the whole message fail.
+        """
+        if not _SURROGATE_RE.search(text):
+            return text
+        return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+
+    @classmethod
+    def clean_header_value(cls, value: Optional[str]) -> str:
+        """Make a value safe for a single header line: no line breaks, control chars or surrogates."""
+        return " ".join(_HEADER_BREAK_RE.sub(" ", cls.fix_surrogates(value or "")).split())
+
+    @classmethod
+    def safe_decode(cls, data: Any, default: str = "") -> str:
         """Safely decode binary data to string using multiple encoding fallbacks."""
         if data is None:
             return default
         if isinstance(data, str):
-            return data
+            return cls.fix_surrogates(data)
         if not isinstance(data, (bytes, bytearray)):
             return str(data)
 
@@ -641,7 +659,8 @@ class PSTToMboxConverter:
             if not body_text and not body_html and body_rtf:
                 if HAS_STRIPRTF:
                     try:
-                        body_text = rtf_to_text(body_rtf)
+                        # errors="replace": one undecodable \'xx byte must not discard the whole body
+                        body_text = self.fix_surrogates(rtf_to_text(body_rtf, errors="replace"))
                     except Exception:
                         body_text = body_rtf
                 else:
@@ -655,7 +674,7 @@ class PSTToMboxConverter:
                 subject = self.safe_decode(
                     self.safe_get_attr(pst_message, "subject") or self.safe_get_attr(pst_message, "get_subject")
                 )
-            subject = subject or "(No Subject)"
+            subject = self.clean_header_value(subject) or "(No Subject)"
 
             sender_name, sender_email = self._extract_sender_info(pst_message, hih)
             recipients = self._extract_recipients(pst_message, hih)
@@ -713,20 +732,19 @@ class PSTToMboxConverter:
                 msg = MIMEText("(No message body)", "plain", "utf-8")
 
             msg["Subject"] = subject
-            msg["From"] = self.format_email_address(sender_email, sender_name)
+            msg["From"] = self.clean_header_value(self.format_email_address(sender_email, sender_name))
             msg["Date"] = email.utils.format_datetime(dt)
 
             asctime_date = dt.strftime("%a %b %d %H:%M:%S %Y")
             msg.set_unixfrom(f"From {self._mbox_from_address(sender_email)} {asctime_date}")
 
-            if recipients["To"]:
-                msg["To"] = ", ".join(recipients["To"])
-            if recipients["Cc"]:
-                msg["Cc"] = ", ".join(recipients["Cc"])
-            if recipients["Bcc"]:
-                msg["Bcc"] = ", ".join(recipients["Bcc"])
+            for field in ("To", "Cc", "Bcc"):
+                value = self.clean_header_value(", ".join(recipients[field]))
+                if value:
+                    msg[field] = value
 
             has_mid, msg_id = hih.get_header_item("Message-ID")
+            msg_id = self.clean_header_value(msg_id)
             if has_mid and msg_id:
                 msg["Message-ID"] = msg_id
             else:
@@ -735,15 +753,17 @@ class PSTToMboxConverter:
                 msg["Message-ID"] = f"<{clean_id}@{domain}>"
 
             has_reply_to, reply_to = hih.get_header_item("In-Reply-To")
+            reply_to = self.clean_header_value(reply_to)
             if has_reply_to and reply_to:
                 msg["In-Reply-To"] = reply_to
 
             has_refs, refs = hih.get_header_item("References")
+            refs = self.clean_header_value(refs)
             if has_refs and refs:
                 msg["References"] = refs
 
             if folder_path:
-                msg["X-Folder"] = folder_path
+                msg["X-Folder"] = self.clean_header_value(folder_path)
 
             meta = {
                 "folder": folder_path,

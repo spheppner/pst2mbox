@@ -5,6 +5,12 @@ HeaderItemsHelper - Robust parser and decoder for email transport headers (RFC 5
 from email.header import decode_header
 from typing import Dict, List, Optional, Tuple, Union
 
+# Headers that RFC 5322 allows at most once. Transport headers stored in a PST sometimes contain several
+# header blocks (e.g. from relays or embedded messages); for these fields only the first occurrence counts.
+SINGLE_VALUE_HEADERS = frozenset(
+    {"from", "sender", "reply-to", "to", "cc", "bcc", "subject", "date", "message-id", "in-reply-to", "references"}
+)
+
 
 class HeaderItemsHelper:
     """Helps working with the items contained in the transport headers of an email message."""
@@ -55,6 +61,12 @@ class HeaderItemsHelper:
         current_header_key = None
 
         for h_line in headers_str.splitlines():
+            # An empty line ends the header block. Some PSTs store the whole MIME message as transport
+            # headers; parsing past this point would pick up headers of attached (message/rfc822) mails.
+            if not h_line.strip():
+                if self.__items_dictionary:
+                    break
+                continue
             # Check for header continuation (folding, starts with space or tab)
             if h_line and h_line[0] in (" ", "\t"):
                 if current_header_key:
@@ -89,6 +101,8 @@ class HeaderItemsHelper:
         norm_key = header_item_name.strip().lower()
         if norm_key in self.__items_dictionary:
             val = self.__items_dictionary[norm_key]
+            if norm_key in SINGLE_VALUE_HEADERS:
+                val = val.split("\n", 1)[0]
             if decode:
                 val = self.decode_rfc2047(val)
             return True, val

@@ -2,6 +2,13 @@
 
 All notable changes to `pst2mbox` are documented in this file.
 
+## [2.0.2] - 2026-10-05
+
+### 🐛 Bug Fixes
+- **`surrogates not allowed` failures**: Emoji in RTF-only messages (and corrupt `&#55xxx;` entities in some HTML) produced unpaired UTF-16 surrogates that cannot be encoded as UTF-8, so the whole message was dropped. Surrogate pairs are now joined into the real character; lone surrogates become `�`.
+- **`header value appears to contain an embedded header` failures**: Some PSTs store the entire MIME message as transport headers. The header parser read past the end of the header block and merged `Subject`/`To`/`Date` lines of attached (forwarded) mails into the outer message, which made writing it fail. Parsing now stops at the end of the header block, single-value headers use their first occurrence, and line breaks are stripped from all header values.
+- **Raw RTF source as message body**: When an RTF body contained a byte undefined in its code page, `striprtf` raised and the unconverted RTF markup was written as the body. Undecodable bytes are now replaced instead.
+
 ## [2.0.1] - 2026-10-02
 
 ### 🐛 Bug Fixes
